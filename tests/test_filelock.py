@@ -553,6 +553,42 @@ def test_soft_errors(tmp_path: Path, mocker: MockerFixture) -> None:
         SoftFileLock(tmp_path / "a.lock").acquire()
 
 
+@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="O_NOFOLLOW is not available on this platform")
+def test_soft_lock_opens_with_o_nofollow(tmp_path: Path, mocker: MockerFixture) -> None:
+    # the soft lock file must be created with O_NOFOLLOW so a symlink planted at the lock path is never followed
+    lock_path = tmp_path / "a.lock"
+    spy = mocker.spy(os, "open")
+
+    with SoftFileLock(lock_path):
+        pass
+
+    lock_open_flags = [call[0][1] for call in spy.call_args_list if str(call[0][0]) == str(lock_path)]
+    assert lock_open_flags
+    assert all(flags & os.O_NOFOLLOW for flags in lock_open_flags)
+
+
+@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="O_NOFOLLOW is not available on this platform")
+@pytest.mark.parametrize("target_exists", [True, False], ids=["existing_target", "dangling_target"])
+def test_soft_lock_does_not_follow_symlink(tmp_path: Path, target_exists: bool) -> None:  # noqa: FBT001
+    # an attacker plants a symlink at the lock path pointing to a file they want the lock to create or truncate
+    target = tmp_path / "victim.txt"
+    if target_exists:
+        target.write_text("sensitive data")
+    lock_path = tmp_path / "a.lock"
+    lock_path.symlink_to(target)
+
+    lock = SoftFileLock(lock_path, timeout=0)
+    with pytest.raises(OSError):  # noqa: PT011 # Timeout (EEXIST) or ELOOP - never a lock acquired through the symlink
+        lock.acquire()
+
+    assert not lock.is_locked
+    assert lock_path.is_symlink()
+    if target_exists:
+        assert target.read_text() == "sensitive data"
+    else:
+        assert not target.exists()
+
+
 def _check_file_read_write(txt_file: Path) -> None:
     for _ in range(3):
         uuid = str(uuid4())
