@@ -15,7 +15,8 @@ def raise_on_not_writable_file(filename: str) -> None:
     :raises OSError: as if the file was opened for writing.
     """
     try:  # use stat to do exists + can write to check without race condition
-        file_stat = os.stat(filename)  # noqa: PTH116
+        # lstat, not stat: do not follow a symlink swapped in at the lock path, as it would be judged by its target
+        file_stat = os.lstat(filename)
     except OSError:
         return  # swallow does not exist or other errors
 

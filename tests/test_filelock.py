@@ -8,16 +8,17 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from errno import ENOSYS
+from errno import EIO, ENOSYS, EWOULDBLOCK
 from inspect import getframeinfo, stack
 from pathlib import Path, PurePath
-from stat import S_IWGRP, S_IWOTH, S_IWUSR, filemode
+from stat import S_IMODE, S_IWGRP, S_IWOTH, S_IWUSR, filemode
 from types import TracebackType
 from typing import TYPE_CHECKING, Callable, Iterator, Tuple, Type, Union
 from uuid import uuid4
 
 import pytest
 from filelock import BaseFileLock, FileLock, SoftFileLock, Timeout, UnixFileLock, WindowsFileLock
+from filelock._unix import has_fcntl
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
@@ -546,6 +547,117 @@ def test_flock_not_implemented_unix(tmp_path: Path, mocker: MockerFixture) -> No
     mocker.patch("fcntl.flock", side_effect=OSError(ENOSYS, "mock error"))
     with pytest.raises(NotImplementedError), FileLock(tmp_path / "a.lock"):
         pass
+
+
+NeedsFlock = pytest.mark.skipif(sys.platform == "win32" or not has_fcntl, reason="needs fcntl.flock")
+
+
+@NeedsFlock
+@pytest.mark.parametrize("mode", [pytest.param(None, id="default-mode"), pytest.param(0o666, id="explicit-mode")])
+@pytest.mark.parametrize("place", ["rename", "hard-link"])
+def test_winner_leaves_existing_file_as_found(tmp_path: Path, mode: int | None, place: str) -> None:
+    journal = tmp_path / "journal.log"
+    journal.write_text("data")
+    journal.chmod(0o600)
+    lock_path = tmp_path / "resource.lock"
+    # A file renamed or hard-linked to the lock path is indistinguishable from a lock file an earlier holder left.
+    if place == "rename":
+        journal.rename(lock_path)
+    else:
+        os.link(str(journal), str(lock_path))
+
+    lock = FileLock(str(lock_path), timeout=0) if mode is None else FileLock(str(lock_path), timeout=0, mode=mode)
+    with lock:
+        assert lock.is_locked
+        assert (lock_path.read_text(), S_IMODE(lock_path.stat().st_mode)) == ("data", 0o600)
+    assert (lock_path.read_text(), S_IMODE(lock_path.stat().st_mode)) == ("data", 0o600)
+    if place == "hard-link":
+        assert (journal.read_text(), S_IMODE(journal.stat().st_mode)) == ("data", 0o600)
+
+
+@NeedsFlock
+def test_contender_leaves_holder_file_as_found(tmp_path: Path) -> None:
+    lock_path = tmp_path / "resource.lock"
+    with FileLock(str(lock_path), mode=0o600):
+        lock_path.write_text("holder metadata")
+
+        # A contender that loses the flock must neither truncate the holder's file nor change its mode.
+        with pytest.raises(Timeout):
+            FileLock(str(lock_path), mode=0o666, timeout=0).acquire()
+
+        assert (lock_path.read_text(), S_IMODE(lock_path.stat().st_mode)) == ("holder metadata", 0o600)
+
+
+@NeedsFlock
+def test_creator_that_loses_the_flock_applies_mode(tmp_path: Path, mocker: MockerFixture) -> None:
+    lock_path = tmp_path / "resource.lock"
+    # A peer may win the flock first, and only the creator may set the mode.
+    mocker.patch("fcntl.flock", side_effect=OSError(EWOULDBLOCK, "Resource temporarily unavailable"))
+
+    initial_umask = os.umask(0o077)
+    try:
+        with pytest.raises(Timeout):
+            FileLock(str(lock_path), timeout=0, mode=0o666).acquire()
+    finally:
+        os.umask(initial_umask)
+
+    assert S_IMODE(lock_path.stat().st_mode) == 0o666
+
+
+@NeedsFlock
+@pytest.mark.parametrize("error", [pytest.param(EIO, id="EIO"), pytest.param(ENOSYS, id="ENOSYS")])
+def test_post_open_fchmod_failure_closes_fd(tmp_path: Path, mocker: MockerFixture, error: int) -> None:
+    # An fchmod that answers ENOSYS says nothing about flock, so it must not be reported as a missing flock.
+    mocker.patch("os.fchmod", side_effect=OSError(error, "mock fchmod error"))
+    open_spy = mocker.spy(os, "open")
+    close_spy = mocker.spy(os, "close")
+
+    with pytest.raises(OSError, match="mock fchmod error"):
+        FileLock(str(tmp_path / "resource.lock"), timeout=0, mode=0o644).acquire()
+
+    assert any(call[0] and call[0][0] == open_spy.spy_return for call in close_spy.call_args_list)
+
+
+@NeedsFlock
+def test_lock_file_unlinked_between_the_opens_is_retried(tmp_path: Path, mocker: MockerFixture) -> None:
+    lock_path = tmp_path / "resource.lock"
+    lock_path.touch()
+    real_open = os.open
+    unlinked: list[str] = []
+
+    def unlink_then_open(path: str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        if path == str(lock_path) and not flags & os.O_CREAT and not unlinked:
+            lock_path.unlink()
+            unlinked.append(path)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    mocker.patch("os.open", side_effect=unlink_then_open)
+
+    with FileLock(str(lock_path), timeout=1) as lock:
+        assert lock.is_locked
+    assert unlinked
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="creating a symlink needs privileges on Windows")
+@pytest.mark.parametrize("target_kind", ["read-only-file", "directory"])
+def test_soft_lock_writability_check_does_not_follow_symlink(tmp_path: Path, target_kind: str) -> None:
+    target = tmp_path / "target"
+    if target_kind == "directory":
+        target.mkdir()
+    else:
+        target.write_text("sensitive data")
+        target.chmod(0o444)
+    lock_path = tmp_path / "a.lock"
+    lock_path.symlink_to(target)
+
+    # Judged by its target the symlink would raise PermissionError or IsADirectoryError; judged as itself it is a lock
+    # someone holds.
+    with pytest.raises(Timeout):
+        SoftFileLock(str(lock_path), timeout=0).acquire()
+
+    assert lock_path.is_symlink()
+    if target_kind == "read-only-file":
+        assert target.read_text() == "sensitive data"
 
 
 def test_soft_errors(tmp_path: Path, mocker: MockerFixture) -> None:

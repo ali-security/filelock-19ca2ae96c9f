@@ -85,7 +85,7 @@ class BaseFileLock(ABC, contextlib.ContextDecorator):
         to a negative value. A timeout of 0 means, that there is exactly one attempt to acquire the file lock.
         :param mode: file permissions for the lockfile. On Windows a native lock creates its file with an owner-only ACL
         when the mode has no group and other bits; any other mode, and a soft lock, leave the file the ACL its directory
-        hands down.
+        hands down. A Unix lock file that already exists keeps its permissions.
         :param thread_local: Whether this object's internal context should be thread local or not.
         If this is set to ``False`` then the lock will be reentrant across threads.
         """
