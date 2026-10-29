@@ -83,7 +83,9 @@ class BaseFileLock(ABC, contextlib.ContextDecorator):
         :param timeout: default timeout when acquiring the lock, in seconds. It will be used as fallback value in
         the acquire method, if no timeout value (``None``) is given. If you want to disable the timeout, set it
         to a negative value. A timeout of 0 means, that there is exactly one attempt to acquire the file lock.
-        :param mode: file permissions for the lockfile.
+        :param mode: file permissions for the lockfile. On Windows a native lock creates its file with an owner-only ACL
+        when the mode has no group and other bits; any other mode, and a soft lock, leave the file the ACL its directory
+        hands down.
         :param thread_local: Whether this object's internal context should be thread local or not.
         If this is set to ``False`` then the lock will be reentrant across threads.
         """

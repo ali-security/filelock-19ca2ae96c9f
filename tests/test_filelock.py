@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -587,6 +588,66 @@ def test_soft_lock_does_not_follow_symlink(tmp_path: Path, target_exists: bool) 
         assert target.read_text() == "sensitive data"
     else:
         assert not target.exists()
+
+
+def _icacls(*args: str | Path) -> bytes:  # pragma: win32 cover
+    icacls = Path(os.environ["SYSTEMROOT"], "System32", "icacls.exe")
+    # str() each argument: Python 3.7 on Windows does not accept path-like items in the argument list
+    return subprocess.run([str(icacls), *map(str, args)], capture_output=True, check=True).stdout
+
+
+@pytest.fixture()
+def inheriting_directory(tmp_path: Path) -> Path:  # pragma: win32 cover
+    # A directory whose ACL has no inheritable entry hands a new file the token's default DACL, which icacls cannot
+    # tell from an explicit one, so grant Users an inheritable entry for the file to show as (I).
+    directory = tmp_path / "inheriting"
+    directory.mkdir()
+    _icacls(directory, "/grant", "*S-1-5-32-545:(OI)(CI)(RX)")
+    return directory
+
+
+@WindowsOnly
+@pytest.mark.parametrize(
+    ("mode", "inherits"),
+    [
+        pytest.param(0o644, True, id="default"),
+        pytest.param(0o666, True, id="others-write"),
+        pytest.param(0o600, False, id="owner-only"),
+    ],
+)
+def test_windows_owner_only_mode_keeps_out_the_directory_acl(
+    inheriting_directory: Path,
+    mode: int,
+    inherits: bool,
+) -> None:  # pragma: win32 cover
+    lock_path = inheriting_directory / "a"
+    with FileLock(str(lock_path), mode=mode):
+        acl = _icacls(lock_path)
+    # icacls marks each entry the directory handed down with (I), whatever the display language.
+    assert (b"(I)" in acl) is inherits
+
+
+@pytest.mark.parametrize("mode", [0o644, 0o600], ids=["default", "owner-only"])
+def test_lock_mode_keeps_mutual_exclusion(tmp_path: Path, mode: int) -> None:
+    lock_path = tmp_path / "a"
+    first = FileLock(str(lock_path), mode=mode)
+    second = FileLock(str(lock_path), mode=mode, timeout=0)
+    with first:
+        assert first.is_locked
+        with pytest.raises(Timeout):
+            second.acquire()
+        assert not second.is_locked
+    with second:
+        assert second.is_locked
+
+
+@pytest.mark.parametrize("mode", [0o644, 0o600], ids=["default", "owner-only"])
+@pytest.mark.timeout(5)  # timeout in case the error is mistaken for contention
+def test_lock_mode_reports_missing_directory(tmp_path: Path, mode: int) -> None:
+    lock = FileLock(str(tmp_path / "missing" / "a"), mode=mode)
+    with pytest.raises(FileNotFoundError):
+        lock.acquire()
+    assert not lock.is_locked
 
 
 def _check_file_read_write(txt_file: Path) -> None:
