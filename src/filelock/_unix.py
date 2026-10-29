@@ -34,6 +34,9 @@ else:  # pragma: win32 no cover
 
         def _acquire(self) -> None:
             open_flags = os.O_RDWR | os.O_CREAT | os.O_TRUNC
+            o_nofollow = getattr(os, "O_NOFOLLOW", None)
+            if o_nofollow is not None:
+                open_flags |= o_nofollow
             fd = os.open(self.lock_file, open_flags, self._context.mode)
             with suppress(PermissionError):  # This locked is not owned by this UID
                 os.fchmod(fd, self._context.mode)
